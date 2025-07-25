@@ -4,7 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 	"log"
-	utils "maelstrom-utils"
+	utils "github.com/tobiajo/gossip-gloomers/utils"
 	"strconv"
 	"sync"
 

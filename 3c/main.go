@@ -2,7 +2,7 @@ package main
 
 import (
 	"log"
-	utils "maelstrom-utils"
+	utils "github.com/tobiajo/gossip-gloomers/utils"
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"

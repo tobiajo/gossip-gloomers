@@ -2,7 +2,7 @@ package main
 
 import (
 	"log"
-	utils "maelstrom-utils"
+	utils "github.com/tobiajo/gossip-gloomers/utils"
 	"strconv"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"

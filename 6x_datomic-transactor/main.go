@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"log"
-	utils "maelstrom-utils"
+	utils "github.com/tobiajo/gossip-gloomers/utils"
 
 	uuid "github.com/google/uuid"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
