@@ -40,8 +40,6 @@ const (
 )
 
 // https://tikv.org/deep-dive/distributed-transaction/percolator/
-
-// TODO test with happy path and then commit
 func main() {
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
@@ -115,10 +113,32 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 		return nil, err
 	}
 
+	earlierTxn := false
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := cells[i]
 		if c.Lock != nil && c.Ts < startTs {
-			return nil, errors.New("earlier-started transaction found") // TODO retry
+			log.Default().Printf("[key=%d, startTs=%d] earlier on-going transaction at %d", key, startTs, c.Ts)
+			earlierTxn = true
+			break
+		}
+	}
+	// retry until no earlier on-going transactions
+	for earlierTxn {
+		// TODO can be stuck here because lacking rollback on write conflict ???
+		// compare result with direct clean-up, then also on read
+		cells, err = utils.ReadOrElse(kv, keyStr, []cell{})
+		if err != nil {
+			return nil, err
+		}
+		for i := len(cells) - 1; i >= 0; i-- {
+			c := cells[i]
+			if c.Lock != nil && c.Ts < startTs {
+				break
+			}
+			if i == 0 {
+				log.Default().Printf("[key=%d, startTs=%d] proceeding with read", key, startTs)
+				earlierTxn = false
+			}
 		}
 	}
 
@@ -164,7 +184,8 @@ func preWrite(kv *maelstrom.KV, key int, startTs int, data int, primary int) err
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := &cells[i]
 		if c.Lock != nil && c.Ts > startTs {
-			return errors.New("write conflict: " + strconv.Itoa(c.Ts) + " > " + strconv.Itoa(startTs)) // TODO rollback and abortion response ???
+			log.Default().Printf("[key=%d, startTs=%d, data=%d, primary=%d] newer lock at %d", key, startTs, data, primary, c.Ts)
+			return errors.New("write conflict") // TODO rollback and abortion response ???
 		}
 		if c.Lock != nil && c.Ts == startTs {
 			if *c.Lock != primary {
@@ -184,7 +205,12 @@ func preWrite(kv *maelstrom.KV, key int, startTs int, data int, primary int) err
 		})
 	}
 
-	return kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true) // TODO handle CAS failure, retry ???
+	err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
+	if err != nil {
+		log.Default().Printf("[key=%d, startTs=%d, data=%d, primary=%d] retrying preWrite due to CAS failure", key, startTs, data, primary)
+		return preWrite(kv, key, startTs, data, primary)
+	}
+	return nil
 }
 
 func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int) error {
@@ -223,5 +249,10 @@ func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int) e
 		})
 	}
 
-	return kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true) // TODO handle CAS failure, retry ???
+	err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
+	if err != nil {
+		log.Default().Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d] retrying commit due to CAS failure", key, startTs, commitTs, primary)
+		return commit(kv, key, startTs, commitTs, primary)
+	}
+	return nil
 }
