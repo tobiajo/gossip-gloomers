@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log"
+
+	. "github.com/tobiajo/gossip-gloomers/common"
 	utils "github.com/tobiajo/gossip-gloomers/utils"
 
 	uuid "github.com/google/uuid"
@@ -13,8 +15,7 @@ type server struct {
 	kv *maelstrom.KV
 }
 
-type transaction = []operation
-type operation = [3]any
+type transaction = []TxnOp
 
 func main() {
 	n := maelstrom.NewNode()
@@ -40,7 +41,7 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 	return res, nil
 }
 
-func transact(kv *maelstrom.KV, txn transaction) (transaction, error) {
+func transact(kv *maelstrom.KV, txn []TxnOp) ([]TxnOp, error) {
 	stateRef, err := utils.ReadOrElse(kv, "STATE_REF", "")
 	if err != nil {
 		return nil, err
@@ -52,16 +53,13 @@ func transact(kv *maelstrom.KV, txn transaction) (transaction, error) {
 
 	result := transaction{}
 	for _, op := range txn {
-		name := op[0].(string)
-		key := int(op[1].(float64))
-		switch name {
+		switch op.Op {
 		case "r":
-			value := state[key]
-			result = append(result, operation{name, key, value})
+			value := state[op.Key]
+			result = append(result, NewTxnOp(op.Op, op.Key, &value))
 		case "w":
-			value := int(op[2].(float64))
-			state[key] = value
-			result = append(result, operation{name, key, value})
+			state[op.Key] = *op.Value
+			result = append(result, NewTxnOp(op.Op, op.Key, op.Value))
 		}
 	}
 

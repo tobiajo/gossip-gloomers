@@ -2,8 +2,10 @@ package main
 
 import (
 	"log"
-	utils "github.com/tobiajo/gossip-gloomers/utils"
 	"sync"
+
+	. "github.com/tobiajo/gossip-gloomers/common"
+	utils "github.com/tobiajo/gossip-gloomers/utils"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -13,8 +15,7 @@ type server struct {
 	mu    sync.Mutex
 }
 
-type transaction = []operation
-type operation = [3]any
+type transaction = []TxnOp
 
 // Challenge #6a: Single-Node, Totally-Available Transactions
 // https://fly.io/dist-sys/6a
@@ -35,16 +36,13 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 
 	result := transaction{}
 	for _, op := range req.Txn {
-		name := op[0].(string)
-		key := int(op[1].(float64))
-		switch name {
+		switch op.Op {
 		case "r":
-			value := s.state[key]
-			result = append(result, operation{name, key, value})
+			value := s.state[op.Key]
+			result = append(result, NewTxnOp(op.Op, op.Key, &value))
 		case "w":
-			value := int(op[2].(float64))
-			s.state[key] = value
-			result = append(result, operation{name, key, value})
+			s.state[op.Key] = *op.Value
+			result = append(result, NewTxnOp(op.Op, op.Key, op.Value))
 		}
 	}
 

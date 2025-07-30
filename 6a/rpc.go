@@ -1,9 +1,13 @@
 package main
 
+import (
+	. "github.com/tobiajo/gossip-gloomers/common"
+)
+
 type Txn struct {
-	Txn [][3]any `json:"txn"`
+	Txn []TxnOp `json:"txn"`
 }
 
 type TxnOk struct {
-	Txn [][3]any `json:"txn"`
+	Txn []TxnOp `json:"txn"`
 }

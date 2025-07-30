@@ -3,6 +3,8 @@ package utils
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -43,6 +45,7 @@ func RegisterAsyncHandler[Req any](n *maelstrom.Node, typ string, handler func(R
 	})
 }
 
+// Stubborn synchronous send, retries until successful response.
 func Send[Req any, Res any](n *maelstrom.Node, typ string, dest string, req Req) (Res, error) {
 	reqJson, err := asJson(req)
 	if err != nil {
@@ -52,6 +55,7 @@ func Send[Req any, Res any](n *maelstrom.Node, typ string, dest string, req Req)
 
 	msg, err := n.SyncRPC(context.Background(), dest, reqJson)
 	for err != nil {
+		log.Default().Println("Retrying...")
 		time.Sleep(time.Second)
 		msg, err = n.SyncRPC(context.Background(), dest, req)
 	}
@@ -74,6 +78,18 @@ func SendAsync[Req any](n *maelstrom.Node, typ string, dest string, req Req) err
 		return err
 	}
 	return nil
+}
+
+func DeepCopy[T any](src T) (T, error) {
+	var dst T
+	bytes, err := json.Marshal(src)
+	if err != nil {
+		return dst, fmt.Errorf("deep copy marshal failed: %w", err)
+	}
+	if err := json.Unmarshal(bytes, &dst); err != nil {
+		return dst, fmt.Errorf("deep copy unmarshal failed: %w", err)
+	}
+	return dst, nil
 }
 
 func asJson(v any) (map[string]any, error) {

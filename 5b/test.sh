@@ -2,7 +2,9 @@
 
 set -e
 
-cd "$( cd -- "$( dirname "$(readlink -f "${BASH_SOURCE[0]}")" )" &> /dev/null && pwd )/.."
+SCRIPT_DIR="$( cd -- "$( dirname "$(readlink -f "${BASH_SOURCE[0]}")" )" &> /dev/null && pwd )"
+CHALLENGE="$(basename "$SCRIPT_DIR")"
 
-go build -o bin/5b ./5b
-maelstrom test -w kafka --bin bin/5b --node-count 2 --concurrency 4n --time-limit 20 --rate 1000
+cd "$SCRIPT_DIR"/..
+go build -o bin/"$CHALLENGE" ./"$CHALLENGE"
+maelstrom test -w kafka --bin bin/"$CHALLENGE" --node-count 2 --concurrency 4n --time-limit 20 --rate 1000

@@ -4,9 +4,10 @@ import (
 	"context"
 	"hash/fnv"
 	"log"
-	utils "github.com/tobiajo/gossip-gloomers/utils"
 	"strconv"
 	"sync"
+
+	utils "github.com/tobiajo/gossip-gloomers/utils"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	cmap "github.com/orcaman/concurrent-map/v2"

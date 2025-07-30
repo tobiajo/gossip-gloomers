@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"log"
+
+	. "github.com/tobiajo/gossip-gloomers/common"
 	utils "github.com/tobiajo/gossip-gloomers/utils"
 
 	uuid "github.com/google/uuid"
@@ -13,8 +15,7 @@ type server struct {
 	kv *maelstrom.KV
 }
 
-type transaction = []operation
-type operation = [3]any
+type transaction = []TxnOp
 
 func main() {
 	n := maelstrom.NewNode()
@@ -33,22 +34,19 @@ func main() {
 func (s *server) txnHandler(req Txn) (TxnOk, error) {
 	txnLog, err := appendTxnLog(s.kv, req.Txn)
 	for err != nil {
-		txnLog, err = appendTxnLog(s.kv, req.Txn)
+		txnLog, err = appendTxnLog(s.kv, req.Txn) // retry once
 	}
 	state := recoverState(txnLog)
 
 	result := transaction{}
 	for _, op := range req.Txn {
-		name := op[0].(string)
-		key := int(op[1].(float64))
-		switch name {
+		switch op.Op {
 		case "r":
-			value := state[key]
-			result = append(result, operation{name, key, value})
+			value := state[op.Key]
+			result = append(result, NewTxnOp(op.Op, op.Key, &value))
 		case "w":
-			value := int(op[2].(float64))
-			state[key] = value
-			result = append(result, operation{name, key, value})
+			state[op.Key] = *op.Value
+			result = append(result, NewTxnOp(op.Op, op.Key, op.Value))
 		}
 	}
 
@@ -58,7 +56,7 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 	return res, nil
 }
 
-func appendTxnLog(kv *maelstrom.KV, txn []operation) ([]transaction, error) {
+func appendTxnLog(kv *maelstrom.KV, txn transaction) ([]transaction, error) {
 	txnLogRef, err := utils.ReadOrElse(kv, "TXN_LOG_REF", "")
 	if err != nil {
 		return *new([]transaction), err
@@ -86,12 +84,9 @@ func recoverState(txnLog []transaction) map[int]int {
 	state := map[int]int{}
 	for _, txn := range txnLog {
 		for _, op := range txn {
-			name := op[0].(string)
-			key := int(op[1].(float64))
-			switch name {
+			switch op.Op {
 			case "w":
-				value := int(op[2].(float64))
-				state[key] = value
+				state[op.Key] = *op.Value
 			}
 		}
 	}

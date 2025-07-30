@@ -3,8 +3,9 @@ package main
 import (
 	"context"
 	"log"
-	utils "github.com/tobiajo/gossip-gloomers/utils"
 	"sync"
+
+	utils "github.com/tobiajo/gossip-gloomers/utils"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )

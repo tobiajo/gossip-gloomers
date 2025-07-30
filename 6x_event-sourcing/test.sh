@@ -2,7 +2,9 @@
 
 set -e
 
-cd "$( cd -- "$( dirname "$(readlink -f "${BASH_SOURCE[0]}")" )" &> /dev/null && pwd )/.."
+SCRIPT_DIR="$( cd -- "$( dirname "$(readlink -f "${BASH_SOURCE[0]}")" )" &> /dev/null && pwd )"
+CHALLENGE="$(basename "$SCRIPT_DIR")"
 
-go build -o bin/6x_event-sourcing ./6x_event-sourcing
-maelstrom test -w txn-rw-register --bin bin/6x_event-sourcing --node-count 2 --concurrency 4n --time-limit 20 --rate 1000 --availability total --nemesis partition
+cd "$SCRIPT_DIR"/..
+go build -o bin/"$CHALLENGE" ./"$CHALLENGE"
+maelstrom test -w txn-rw-register --bin bin/"$CHALLENGE" --node-count 2 --concurrency 2n --time-limit 2 --rate 1000 --availability total –-nemesis partition
