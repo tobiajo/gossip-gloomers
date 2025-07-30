@@ -22,18 +22,13 @@ type transaction = []TxnOp
 type cell struct {
 	Ts    int    `json:"ts"`
 	Data  *int   `json:"data"`
-	Lock  *lock  `json:"lock"` // key of the transaction that locked this cell
+	Lock  *int   `json:"lock"` // key of the transaction that locked this cell
 	Write *write `json:"write"`
 }
 
-type lock struct {
-	Primary int `json:"primary"`
-	Count   int `json:"count"`
-}
-
 type write struct {
-	StartTS int       `json:"start_ts"`
-	Kind    writeKind `json:"kind"`
+	DataTs int       `json:"data_ts"`
+	Kind   writeKind `json:"kind"`
 }
 
 type writeKind string
@@ -130,14 +125,25 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 	var dataTs *int = nil
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := cells[i]
-		if c.Write != nil && c.Write.StartTS <= startTs {
-			dataTs = new(int)
-			*dataTs = c.Write.StartTS
-			continue
-		}
-		if dataTs != nil && c.Ts == *dataTs {
+		// from same transaction
+		if c.Ts == startTs {
+			if c.Lock == nil {
+				panic("expected lock")
+			}
 			return c.Data, nil
 		}
+		// from earlier transaction
+		if c.Write != nil && c.Write.DataTs < startTs {
+			dataTs = new(int)
+			*dataTs = c.Write.DataTs
+			continue
+		}
+		if dataTs != nil && *dataTs == c.Ts {
+			return c.Data, nil
+		}
+	}
+	if dataTs != nil {
+		panic("commited data not found")
 	}
 
 	return nil, nil
@@ -161,8 +167,10 @@ func preWrite(kv *maelstrom.KV, key int, startTs int, data int, primary int) err
 			return errors.New("write conflict: " + strconv.Itoa(c.Ts) + " > " + strconv.Itoa(startTs)) // TODO rollback and abortion response ???
 		}
 		if c.Lock != nil && c.Ts == startTs {
+			if *c.Lock != primary {
+				panic("primary mismatch")
+			}
 			c.Data = &data // override previous write in same transaction
-			c.Lock.Count++
 			override = true
 			break
 		}
@@ -172,10 +180,7 @@ func preWrite(kv *maelstrom.KV, key int, startTs int, data int, primary int) err
 		cells = append(cells, cell{
 			Ts:   startTs,
 			Data: &data,
-			Lock: &lock{
-				Primary: primary,
-				Count:   1,
-			},
+			Lock: &primary,
 		})
 	}
 
@@ -193,26 +198,30 @@ func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int) e
 		return err
 	}
 
+	// remove lock
+	removed := false
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := &cells[i]
-		if c.Ts == startTs && c.Lock != nil && c.Lock.Primary == primary {
-			c.Lock.Count--
-			if c.Lock.Count == 0 {
-				c.Lock = nil
+		if c.Ts == startTs && c.Lock != nil {
+			if *c.Lock != primary {
+				panic("primary mismatch")
 			}
+			c.Lock = nil
+			removed = true
 			break
 		}
-		if i == 0 {
-			return errors.New("lock not found")
-		}
 	}
-	cells = append(cells, cell{
-		Ts: commitTs,
-		Write: &write{
-			StartTS: startTs,
-			Kind:    writePut,
-		},
-	})
+
+	// mark write (at most once)
+	if removed {
+		cells = append(cells, cell{
+			Ts: commitTs,
+			Write: &write{
+				DataTs: startTs,
+				Kind:   writePut,
+			},
+		})
+	}
 
 	return kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true) // TODO handle CAS failure, retry ???
 }
