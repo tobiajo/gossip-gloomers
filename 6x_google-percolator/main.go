@@ -176,8 +176,9 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 			return c.Data, nil
 		}
 
-		// from earlier transaction
-		if c.Write != nil && c.Write.Kind == writeCommit && c.Write.DataTs < startTs {
+		// from earlier transaction, both issued and committed
+		// TODO should only check if primary commited ???
+		if c.Write != nil && c.Write.Kind == writeCommit && c.Write.DataTs < startTs && c.Ts < startTs {
 			dataTs = new(int)
 			*dataTs = c.Write.DataTs
 			continue
@@ -211,6 +212,7 @@ func prepare(kv *maelstrom.KV, key int, startTs int, data int, primary int) (boo
 			log.Printf("[key=%d, startTs=%d, data=%d, primary=%d] newer lock at %d", key, startTs, data, primary, c.Ts)
 			return false, nil
 		}
+		// TODO missing conflict where primary commited and secondries not ???
 		if c.Write != nil && c.Write.Kind == writeCommit && c.Ts > startTs { // TODO is this correct ???
 			log.Printf("[key=%d, startTs=%d, data=%d, primary=%d] newer commit at %d", key, startTs, data, primary, c.Ts)
 			return false, nil
