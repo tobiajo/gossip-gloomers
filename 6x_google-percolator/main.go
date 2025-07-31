@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log"
 	"strconv"
 
@@ -34,12 +33,12 @@ type write struct {
 type writeKind string
 
 const (
-	writePut      writeKind = "Put"
-	writeDelete   writeKind = "Delete"
+	writeCommit   writeKind = "Commit"
 	writeRollback writeKind = "Rollback"
 )
 
 // https://tikv.org/deep-dive/distributed-transaction/percolator/
+// TODO danglig lock clean-up after crashes
 func main() {
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
@@ -57,11 +56,13 @@ func main() {
 }
 
 func (s *server) txnHandler(req Txn) (TxnOk, error) {
-	// Prewrite phase
+	// Prepare phase
 	startTs, err := s.tso.Get()
 	if err != nil {
 		return *new(TxnOk), err
 	}
+
+	writeConflict := false
 
 	result := transaction{}
 	var primary *int = nil
@@ -78,8 +79,13 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 				primary = new(int)
 				*primary = op.Key
 			}
-			if err := preWrite(s.kv, op.Key, startTs, *op.Value, *primary); err != nil {
+			conflictFree, err := prepare(s.kv, op.Key, startTs, *op.Value, *primary)
+			if err != nil {
 				return *new(TxnOk), err
+			}
+			writeConflict = writeConflict || !conflictFree
+			if writeConflict {
+				break
 			}
 			result = append(result, NewTxnOp(op.Op, op.Key, op.Value))
 		}
@@ -91,13 +97,25 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 		return *new(TxnOk), err
 	}
 
+	var kind writeKind
+	if writeConflict {
+		kind = writeRollback
+	} else {
+		kind = writeCommit
+	}
+
 	for _, op := range req.Txn {
 		switch op.Op {
 		case "w":
-			if err := commit(s.kv, op.Key, startTs, commitTs, *primary); err != nil {
+			if _, err := commit(s.kv, op.Key, startTs, commitTs, *primary, kind); err != nil {
 				return *new(TxnOk), err
 			}
 		}
+	}
+
+	if writeConflict {
+		log.Default().Printf("[req=%v] aborting transaction due to write conflict", req)
+		return *new(TxnOk), &maelstrom.RPCError{Code: maelstrom.TxnConflict, Text: "The requested transaction has been aborted because of a conflict with another transaction. Servers need not return this error on every conflict: they may choose to retry automatically instead."}
 	}
 
 	res := TxnOk{
@@ -117,15 +135,13 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := cells[i]
 		if c.Lock != nil && c.Ts < startTs {
-			log.Default().Printf("[key=%d, startTs=%d] earlier on-going transaction at %d", key, startTs, c.Ts)
+			log.Default().Printf("[key=%d, startTs=%d] awaiting transaction at %d", key, startTs, c.Ts)
 			earlierTxn = true
 			break
 		}
 	}
 	// retry until no earlier on-going transactions
 	for earlierTxn {
-		// TODO can be stuck here because lacking rollback on write conflict ???
-		// compare result with direct clean-up, then also on read
 		cells, err = utils.ReadOrElse(kv, keyStr, []cell{})
 		if err != nil {
 			return nil, err
@@ -145,6 +161,7 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 	var dataTs *int = nil
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := cells[i]
+
 		// from same transaction
 		if c.Ts == startTs {
 			if c.Lock == nil {
@@ -152,8 +169,9 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 			}
 			return c.Data, nil
 		}
+
 		// from earlier transaction
-		if c.Write != nil && c.Write.DataTs < startTs {
+		if c.Write != nil && c.Write.Kind == writeCommit && c.Write.DataTs < startTs {
 			dataTs = new(int)
 			*dataTs = c.Write.DataTs
 			continue
@@ -169,15 +187,15 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 	return nil, nil
 }
 
-func preWrite(kv *maelstrom.KV, key int, startTs int, data int, primary int) error {
+func prepare(kv *maelstrom.KV, key int, startTs int, data int, primary int) (bool, error) {
 	keyStr := strconv.Itoa(key)
 	cells, err := utils.ReadOrElse(kv, keyStr, []cell{})
 	if err != nil {
-		return err
+		return *new(bool), err
 	}
 	unmodified, err := utils.DeepCopy(cells)
 	if err != nil {
-		return err
+		return *new(bool), err
 	}
 
 	override := false
@@ -185,7 +203,7 @@ func preWrite(kv *maelstrom.KV, key int, startTs int, data int, primary int) err
 		c := &cells[i]
 		if c.Lock != nil && c.Ts > startTs {
 			log.Default().Printf("[key=%d, startTs=%d, data=%d, primary=%d] newer lock at %d", key, startTs, data, primary, c.Ts)
-			return errors.New("write conflict") // TODO rollback and abortion response ???
+			return false, nil
 		}
 		if c.Lock != nil && c.Ts == startTs {
 			if *c.Lock != primary {
@@ -207,24 +225,23 @@ func preWrite(kv *maelstrom.KV, key int, startTs int, data int, primary int) err
 
 	err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
 	if err != nil {
-		log.Default().Printf("[key=%d, startTs=%d, data=%d, primary=%d] retrying preWrite due to CAS failure", key, startTs, data, primary)
-		return preWrite(kv, key, startTs, data, primary)
+		log.Default().Printf("[key=%d, startTs=%d, data=%d, primary=%d] retrying prepare due to CAS failure", key, startTs, data, primary)
+		return prepare(kv, key, startTs, data, primary)
 	}
-	return nil
+	return true, nil
 }
 
-func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int) error {
+func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int, kind writeKind) (bool, error) {
 	keyStr := strconv.Itoa(key)
 	cells, err := utils.ReadOrElse(kv, keyStr, []cell{})
 	if err != nil {
-		return err
+		return *new(bool), err
 	}
 	unmodified, err := utils.DeepCopy(cells)
 	if err != nil {
-		return err
+		return *new(bool), err
 	}
 
-	// remove lock
 	removed := false
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := &cells[i]
@@ -232,27 +249,32 @@ func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int) e
 			if *c.Lock != primary {
 				panic("primary mismatch")
 			}
-			c.Lock = nil
+			c.Lock = nil // remove lock
 			removed = true
 			break
 		}
 	}
 
-	// mark write (at most once)
-	if removed {
-		cells = append(cells, cell{
-			Ts: commitTs,
-			Write: &write{
-				DataTs: startTs,
-				Kind:   writePut,
-			},
-		})
+	if !removed {
+		return false, nil // already committed
 	}
+
+	if kind == writeRollback {
+		log.Default().Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] rolling back", key, startTs, commitTs, primary, kind)
+	}
+	cells = append(cells, cell{ // mark write
+		Ts: commitTs,
+		Write: &write{
+			DataTs: startTs,
+			Kind:   kind,
+		},
+	})
 
 	err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
 	if err != nil {
-		log.Default().Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d] retrying commit due to CAS failure", key, startTs, commitTs, primary)
-		return commit(kv, key, startTs, commitTs, primary)
+		log.Default().Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] retrying commit due to CAS failure", key, startTs, commitTs, primary, kind)
+		return commit(kv, key, startTs, commitTs, primary, kind)
 	}
-	return nil
+
+	return true, nil
 }
