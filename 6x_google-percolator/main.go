@@ -105,7 +105,7 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 
 	var kind writeKind
 	if writeConflict {
-		log.Default().Printf("[req=%v] rolling back transaction due to write conflict", req)
+		log.Printf("[req=%v] rolling back transaction due to write conflict", req)
 		kind = writeRollback
 	} else {
 		kind = writeCommit
@@ -141,7 +141,7 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := cells[i]
 		if c.Lock != nil && c.Ts < startTs {
-			log.Default().Printf("[key=%d, startTs=%d] awaiting transaction at %d", key, startTs, c.Ts)
+			log.Printf("[key=%d, startTs=%d] awaiting transaction at %d", key, startTs, c.Ts)
 			earlierTxn = true
 			break
 		}
@@ -158,7 +158,7 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 				break
 			}
 			if i == 0 {
-				log.Default().Printf("[key=%d, startTs=%d] proceeding with read", key, startTs)
+				log.Printf("[key=%d, startTs=%d] proceeding with read", key, startTs)
 				earlierTxn = false
 			}
 		}
@@ -208,7 +208,11 @@ func prepare(kv *maelstrom.KV, key int, startTs int, data int, primary int) (boo
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := &cells[i]
 		if c.Lock != nil && c.Ts > startTs {
-			log.Default().Printf("[key=%d, startTs=%d, data=%d, primary=%d] newer lock at %d", key, startTs, data, primary, c.Ts)
+			log.Printf("[key=%d, startTs=%d, data=%d, primary=%d] newer lock at %d", key, startTs, data, primary, c.Ts)
+			return false, nil
+		}
+		if c.Write != nil && c.Write.Kind == writeCommit && c.Ts > startTs { // TODO is this correct ???
+			log.Printf("[key=%d, startTs=%d, data=%d, primary=%d] newer commit at %d", key, startTs, data, primary, c.Ts)
 			return false, nil
 		}
 		if c.Lock != nil && c.Ts == startTs {
@@ -231,7 +235,7 @@ func prepare(kv *maelstrom.KV, key int, startTs int, data int, primary int) (boo
 
 	err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
 	if err != nil {
-		log.Default().Printf("[key=%d, startTs=%d, data=%d, primary=%d] retrying prepare due to CAS failure", key, startTs, data, primary)
+		log.Printf("[key=%d, startTs=%d, data=%d, primary=%d] retrying prepare due to CAS failure", key, startTs, data, primary)
 		return prepare(kv, key, startTs, data, primary)
 	}
 	return true, nil
@@ -266,7 +270,7 @@ func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int, k
 	}
 
 	if kind == writeRollback {
-		log.Default().Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] rolling back", key, startTs, commitTs, primary, kind)
+		log.Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] rolling back", key, startTs, commitTs, primary, kind)
 	}
 	cells = append(cells, cell{ // mark write
 		Ts: commitTs,
@@ -278,7 +282,7 @@ func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int, k
 
 	err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
 	if err != nil {
-		log.Default().Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] retrying commit due to CAS failure", key, startTs, commitTs, primary, kind)
+		log.Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] retrying commit due to CAS failure", key, startTs, commitTs, primary, kind)
 		return commit(kv, key, startTs, commitTs, primary, kind)
 	}
 

@@ -55,7 +55,7 @@ func Send[Req any, Res any](n *maelstrom.Node, typ string, dest string, req Req)
 	msg, err := n.SyncRPC(context.Background(), dest, reqJson)
 	for err != nil {
 		time.Sleep(time.Second)
-		log.Default().Println("retrying send")
+		log.Println("retrying send")
 		msg, err = n.SyncRPC(context.Background(), dest, req)
 	}
 
