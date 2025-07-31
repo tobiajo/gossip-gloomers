@@ -62,16 +62,21 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 		return *new(TxnOk), err
 	}
 
+	result := transaction{}
+	readCache := make(map[int]*int) // consistent snapshot + own writes
+	var primary *int = nil
 	writeConflict := false
 
-	result := transaction{}
-	var primary *int = nil
 	for _, op := range req.Txn {
 		switch op.Op {
 		case "r":
-			value, err := read(s.kv, op.Key, startTs)
-			if err != nil {
-				return *new(TxnOk), err
+			value, ok := readCache[op.Key]
+			if !ok {
+				value, err = read(s.kv, op.Key, startTs)
+				readCache[op.Key] = value
+				if err != nil {
+					return *new(TxnOk), err
+				}
 			}
 			result = append(result, NewTxnOp(op.Op, op.Key, value))
 		case "w":
@@ -83,6 +88,7 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 			if err != nil {
 				return *new(TxnOk), err
 			}
+			readCache[op.Key] = op.Value
 			writeConflict = writeConflict || !conflictFree
 			if writeConflict {
 				break
@@ -99,6 +105,7 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 
 	var kind writeKind
 	if writeConflict {
+		log.Default().Printf("[req=%v] rolling back transaction due to write conflict", req)
 		kind = writeRollback
 	} else {
 		kind = writeCommit
@@ -114,8 +121,7 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 	}
 
 	if writeConflict {
-		log.Default().Printf("[req=%v] aborting transaction due to write conflict", req)
-		return *new(TxnOk), &maelstrom.RPCError{Code: maelstrom.TxnConflict, Text: "The requested transaction has been aborted because of a conflict with another transaction. Servers need not return this error on every conflict: they may choose to retry automatically instead."}
+		return *new(TxnOk), maelstrom.NewRPCError(maelstrom.TxnConflict, "write conflict")
 	}
 
 	res := TxnOk{
