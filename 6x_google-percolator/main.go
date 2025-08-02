@@ -63,7 +63,7 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 	}
 
 	result := transaction{}
-	readCache := make(map[int]*int) // consistent snapshot + own writes
+	readCache := make(map[int]*int) // TODO replace with read lock to avoid G2 anomolies
 	var primary *int = nil
 	writeConflict := false
 
@@ -137,17 +137,17 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 		return nil, err
 	}
 
-	earlierTxn := false
+	earlierTx := false
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := cells[i]
 		if c.Lock != nil && c.Ts < startTs {
 			log.Printf("[key=%d, startTs=%d] awaiting transaction at %d", key, startTs, c.Ts)
-			earlierTxn = true
+			earlierTx = true
 			break
 		}
 	}
 	// retry until no earlier on-going transactions
-	for earlierTxn {
+	for earlierTx {
 		cells, err = utils.ReadOrElse(kv, keyStr, []cell{})
 		if err != nil {
 			return nil, err
@@ -159,12 +159,14 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 			}
 			if i == 0 {
 				log.Printf("[key=%d, startTs=%d] proceeding with read", key, startTs)
-				earlierTxn = false
+				earlierTx = false
 			}
 		}
 	}
 
 	var dataTs *int = nil
+	var data *int = nil
+
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := cells[i]
 
@@ -173,25 +175,27 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 			if c.Lock == nil {
 				panic("expected lock")
 			}
-			return c.Data, nil
+			data = c.Data
+			break
 		}
 
-		// from earlier transaction, both issued and committed
+		// from earlier transaction
 		// TODO should only check if primary commited ???
-		if c.Write != nil && c.Write.Kind == writeCommit && c.Write.DataTs < startTs && c.Ts < startTs {
+		if c.Write != nil && c.Write.Kind == writeCommit && c.Ts < startTs {
 			dataTs = new(int)
 			*dataTs = c.Write.DataTs
 			continue
 		}
 		if dataTs != nil && *dataTs == c.Ts {
-			return c.Data, nil
+			data = c.Data
+			break
 		}
 	}
-	if dataTs != nil {
+	if dataTs != nil && data == nil {
 		panic("commited data not found")
 	}
 
-	return nil, nil
+	return data, nil
 }
 
 func prepare(kv *maelstrom.KV, key int, startTs int, data int, primary int) (bool, error) {
@@ -205,29 +209,30 @@ func prepare(kv *maelstrom.KV, key int, startTs int, data int, primary int) (boo
 		return *new(bool), err
 	}
 
-	override := false
+	overridden := false
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := &cells[i]
-		if c.Lock != nil && c.Ts > startTs {
-			log.Printf("[key=%d, startTs=%d, data=%d, primary=%d] newer lock at %d", key, startTs, data, primary, c.Ts)
-			return false, nil
+		if c.Lock != nil {
+			if c.Ts == startTs {
+				if *c.Lock != primary {
+					panic("primary mismatch")
+				}
+				c.Data = &data // override previous write in same transaction
+				overridden = true
+				break
+			} else {
+				log.Printf("[key=%d, startTs=%d, data=%d, primary=%d] conflicting lock at %d", key, startTs, data, primary, c.Ts)
+				return false, nil
+			}
 		}
 		// TODO missing conflict where primary commited and secondries not ???
-		if c.Write != nil && c.Write.Kind == writeCommit && c.Ts > startTs { // TODO is this correct ???
+		if c.Ts > startTs && c.Write != nil && c.Write.Kind == writeCommit {
 			log.Printf("[key=%d, startTs=%d, data=%d, primary=%d] newer commit at %d", key, startTs, data, primary, c.Ts)
 			return false, nil
 		}
-		if c.Lock != nil && c.Ts == startTs {
-			if *c.Lock != primary {
-				panic("primary mismatch")
-			}
-			c.Data = &data // override previous write in same transaction
-			override = true
-			break
-		}
 	}
 
-	if !override {
+	if !overridden {
 		cells = append(cells, cell{
 			Ts:   startTs,
 			Data: &data,
@@ -267,26 +272,26 @@ func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int, k
 		}
 	}
 
-	if !removed {
+	if removed {
+		if kind == writeRollback {
+			log.Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] rolling back", key, startTs, commitTs, primary, kind)
+		}
+		cells = append(cells, cell{ // mark write
+			Ts: commitTs,
+			Write: &write{
+				DataTs: startTs,
+				Kind:   kind,
+			},
+		})
+
+		err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
+		if err != nil {
+			log.Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] retrying commit due to CAS failure", key, startTs, commitTs, primary, kind)
+			return commit(kv, key, startTs, commitTs, primary, kind)
+		}
+
+		return true, nil
+	} else {
 		return false, nil // already committed
 	}
-
-	if kind == writeRollback {
-		log.Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] rolling back", key, startTs, commitTs, primary, kind)
-	}
-	cells = append(cells, cell{ // mark write
-		Ts: commitTs,
-		Write: &write{
-			DataTs: startTs,
-			Kind:   kind,
-		},
-	})
-
-	err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
-	if err != nil {
-		log.Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] retrying commit due to CAS failure", key, startTs, commitTs, primary, kind)
-		return commit(kv, key, startTs, commitTs, primary, kind)
-	}
-
-	return true, nil
 }
