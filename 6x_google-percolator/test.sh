@@ -7,4 +7,4 @@ CHALLENGE="$(basename "$SCRIPT_DIR")"
 
 cd "$SCRIPT_DIR"/..
 go build -o bin/"$CHALLENGE" ./"$CHALLENGE"
-maelstrom test -w txn-rw-register --bin bin/"$CHALLENGE" --node-count 2 --concurrency 2n --time-limit 2 --rate 1000 #--availability total –-nemesis partition
+maelstrom test -w txn-rw-register --bin bin/"$CHALLENGE" --node-count 2 --concurrency 2n --time-limit 2 --rate 1000 --availability total –-nemesis partition
