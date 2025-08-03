@@ -10,6 +10,45 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+type ContextKey string
+
+const MsgIdKey ContextKey = "msgId"
+
+func RegisterHandlerWithContext[Req any, Res any](n *maelstrom.Node, typ string, handler func(context.Context, Req) (Res, error)) {
+	n.Handle(typ, func(msg maelstrom.Message) error {
+		ctx, err := ctxWithMsgId(context.Background(), msg)
+		if err != nil {
+			return err
+		}
+
+		var req Req
+		if err = json.Unmarshal(msg.Body, &req); err != nil {
+			return err
+		}
+
+		res, err := handler(ctx, req)
+		if err != nil {
+			return err
+		}
+
+		resJson, err := asJson(res)
+		if err != nil {
+			return err
+		}
+		resJson["type"] = typ + "_ok"
+		return n.Reply(msg, resJson)
+	})
+}
+
+func ctxWithMsgId(ctx context.Context, msg maelstrom.Message) (context.Context, error) {
+	var reqJson map[string]any
+	if err := json.Unmarshal(msg.Body, &reqJson); err != nil {
+		return *new(context.Context), err
+	}
+	msgId := fmt.Sprintf("%s_%s_%s_%d", msg.Src, msg.Dest, reqJson["type"], int(reqJson["msg_id"].(float64)))
+	return context.WithValue(ctx, MsgIdKey, msgId), nil
+}
+
 func RegisterHandler[Req any, Res any](n *maelstrom.Node, typ string, handler func(Req) (Res, error)) {
 	n.Handle(typ, func(msg maelstrom.Message) error {
 		var req Req
@@ -79,18 +118,6 @@ func SendAsync[Req any](n *maelstrom.Node, typ string, dest string, req Req) err
 	return nil
 }
 
-func DeepCopy[T any](src T) (T, error) {
-	var dst T
-	bytes, err := json.Marshal(src)
-	if err != nil {
-		return dst, fmt.Errorf("deep copy marshal failed: %w", err)
-	}
-	if err := json.Unmarshal(bytes, &dst); err != nil {
-		return dst, fmt.Errorf("deep copy unmarshal failed: %w", err)
-	}
-	return dst, nil
-}
-
 func asJson(v any) (map[string]any, error) {
 	vJsonRaw, err := json.Marshal(v)
 	if err != nil {
@@ -115,4 +142,16 @@ func ReadOrElse[V any](kv *maelstrom.KV, key string, defaultValue V) (V, error) 
 		}
 	}
 	return value, nil
+}
+
+func DeepCopy[T any](src T) (T, error) {
+	var dst T
+	bytes, err := json.Marshal(src)
+	if err != nil {
+		return dst, fmt.Errorf("deep copy marshal failed: %w", err)
+	}
+	if err := json.Unmarshal(bytes, &dst); err != nil {
+		return dst, fmt.Errorf("deep copy unmarshal failed: %w", err)
+	}
+	return dst, nil
 }

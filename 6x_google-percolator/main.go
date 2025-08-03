@@ -18,6 +18,11 @@ type server struct {
 	tso *utils.TSO
 }
 
+const (
+	keepVersions   = 1    // MVCC
+	lockSingleRead = true // false causes G2-item anomalies, i.e. fractured reads, which violates snapshot-isolation
+)
+
 type transaction = []TxnOp
 
 type transactionConflict struct {
@@ -31,7 +36,7 @@ func (e *transactionConflict) Error() string {
 type cell struct {
 	Ts    int    `json:"ts"`
 	Data  *int   `json:"data"`
-	Lock  *int   `json:"lock"` // key of the transaction that locked this cell
+	Lock  *int   `json:"lock"` // primary key of the transaction that locked this cell
 	Write *write `json:"write"`
 }
 
@@ -43,12 +48,12 @@ type write struct {
 type writeKind string
 
 const (
-	writeCommit   writeKind = "Commit"
-	writeRollback writeKind = "Rollback"
+	writeCommit   writeKind = "commit"
+	writeRollback writeKind = "rollback"
 )
 
 // https://tikv.org/deep-dive/distributed-transaction/percolator/
-// TODO danglig lock clean-up after crashes
+// TODO clean up danglig lock after crashes
 func main() {
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
@@ -58,25 +63,25 @@ func main() {
 		tso: tso,
 	}
 
-	utils.RegisterHandler(n, "txn", s.txnHandler)
+	utils.RegisterHandlerWithContext(n, "txn", s.txnHandler)
 
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func (s *server) txnHandler(req Txn) (TxnOk, error) {
+func (s *server) txnHandler(ctx context.Context, req Txn) (TxnOk, error) {
 	// Prepare phase
 	startTs, err := s.tso.Get()
 	if err != nil {
 		return *new(TxnOk), err
 	}
 
-	readLocks := getReadLocks(req.Txn)
+	readLocks := getReadLocks(req.Txn, lockSingleRead)
 	locks := mapset.NewSet[int]()
 
 	result := transaction{}
-	primary := req.Txn[0].Key // TODO improve
+	var primary *int
 	var conflict *transactionConflict
 
 	for _, op := range req.Txn {
@@ -84,7 +89,10 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 		case "r":
 			var value *int
 			if readLocks.Contains(op.Key) {
-				value, err = readWithLock(s.kv, op.Key, startTs, primary)
+				if primary == nil {
+					primary = &op.Key
+				}
+				value, err = readWithLock(s.kv, ctx, op.Key, startTs, *primary)
 				if err != nil {
 					if e, ok := err.(*transactionConflict); ok {
 						conflict = e
@@ -94,14 +102,17 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 				}
 				locks.Add(op.Key)
 			} else {
-				value, err = read(s.kv, op.Key, startTs)
+				value, err = read(s.kv, ctx, op.Key, startTs)
 				if err != nil {
 					return *new(TxnOk), err
 				}
 			}
 			result = append(result, NewTxnOp(op.Op, op.Key, value))
 		case "w":
-			err := preWrite(s.kv, op.Key, startTs, *op.Value, primary)
+			if primary == nil {
+				primary = &op.Key
+			}
+			err := preWrite(s.kv, ctx, op.Key, startTs, *op.Value, *primary)
 			if err != nil {
 				if e, ok := err.(*transactionConflict); ok {
 					conflict = e
@@ -115,6 +126,7 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 	}
 
 	// Commit phase
+	// TODO https://tikv.org/deep-dive/distributed-transaction/optimized-percolator/#calculated-commit-timestamp w/o read lock
 	commitTs, err := s.tso.Get()
 	if err != nil {
 		return *new(TxnOk), err
@@ -130,24 +142,23 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 	commited := mapset.NewSet[int]()
 	for _, op := range req.Txn {
 		if op.Op == "w" && locks.Contains(op.Key) && !commited.Contains(op.Key) {
-			if err := commit(s.kv, op.Key, startTs, commitTs, primary, kind); err != nil {
+			if err := commit(s.kv, ctx, op.Key, startTs, commitTs, *primary, kind); err != nil {
 				return *new(TxnOk), err
 			}
-			commited.Add(op.Key)
 			locks.Remove(op.Key)
+			commited.Add(op.Key)
 		}
 	}
 
 	for key := range locks.Iter() {
-		log.Printf("[req=%v] removing read-read lock for key %d", req, key)
-		if err := removeReadLock(s.kv, key, startTs, primary); err != nil { // if no commits; read-read transactions
+		if err := removeReadOnlyLock(s.kv, ctx, key, startTs, *primary); err != nil { // if no commits
 			return *new(TxnOk), err
 		}
 	}
 
 	if conflict != nil {
-		log.Printf("[req=%v] retrying transaction due to conflict", req)
-		return s.txnHandler(req)
+		log.Printf("[msgId=%s, req=%s] retrying transaction due to conflict", ctx.Value(utils.MsgIdKey), req)
+		return s.txnHandler(ctx, req)
 	}
 
 	res := TxnOk{
@@ -156,32 +167,7 @@ func (s *server) txnHandler(req Txn) (TxnOk, error) {
 	return res, nil
 }
 
-// TODO use or remove; unused
-func getReadsBeforeSubsequentOps(txn []TxnOp) mapset.Set[int] {
-	reads := mapset.NewSet[int]()
-	writes := mapset.NewSet[int]()
-	opCount := make(map[int]int)
-
-	for _, op := range txn {
-		opCount[op.Key]++
-		if op.Op == "r" && !writes.Contains(op.Key) {
-			reads.Add(op.Key)
-		} else if op.Op == "w" {
-			writes.Add(op.Key)
-		}
-	}
-
-	filteredReads := mapset.NewSet[int]()
-	for key := range reads.Iter() {
-		if opCount[key] > 1 {
-			filteredReads.Add(key)
-		}
-	}
-
-	return filteredReads
-}
-
-func getReadLocks(txn []TxnOp) mapset.Set[int] {
+func getReadLocks(txn []TxnOp, lockSingleRead bool) mapset.Set[int] {
 	reads := mapset.NewSet[int]()
 	opCount := make(map[int]int)
 
@@ -192,17 +178,20 @@ func getReadLocks(txn []TxnOp) mapset.Set[int] {
 		}
 	}
 
-	// filteredReads := mapset.NewSet[int]()
-	// for key := range reads.Iter() {
-	// 	if opCount[key] > 1 {
-	// 		filteredReads.Add(key)
-	// 	}
-	// }
-
-	return reads //filteredReads
+	if lockSingleRead {
+		return reads
+	} else {
+		filtered := mapset.NewSet[int]()
+		for key := range reads.Iter() {
+			if opCount[key] > 1 {
+				filtered.Add(key)
+			}
+		}
+		return filtered
+	}
 }
 
-func readWithLock(kv *maelstrom.KV, key int, startTs int, primary int) (*int, error) {
+func readWithLock(kv *maelstrom.KV, ctx context.Context, key int, startTs int, primary int) (*int, error) {
 	keyStr := strconv.Itoa(key)
 	cells, err := utils.ReadOrElse(kv, keyStr, []cell{})
 	if err != nil {
@@ -211,7 +200,7 @@ func readWithLock(kv *maelstrom.KV, key int, startTs int, primary int) (*int, er
 
 	locked, err := checkLock(cells, startTs, primary)
 	if err != nil {
-		log.Printf("[key=%d, startTs=%d, primary=%d] read rejection due to %s", key, startTs, primary, err.Error())
+		log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] read rejection due to %s", ctx.Value(utils.MsgIdKey), key, startTs, primary, err)
 		return new(int), err
 	}
 
@@ -222,24 +211,24 @@ func readWithLock(kv *maelstrom.KV, key int, startTs int, primary int) (*int, er
 		if err != nil {
 			return new(int), err
 		}
-		log.Printf("[key=%d, startTs=%d, primary=%d] adding read lock", key, startTs, primary)
+		log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] adding read lock", ctx.Value(utils.MsgIdKey), key, startTs, primary)
 		cells = append(cells, cell{
 			Ts:   startTs,
-			Data: data, // dummy write
+			Data: data, // write existing value
 			Lock: &primary,
 		})
 
 		err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
 		if err != nil {
-			log.Printf("[key=%d, startTs=%d, primary=%d] retrying read with lock due to CAS failure", key, startTs, primary)
-			return readWithLock(kv, key, startTs, primary)
+			log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] retrying read with lock due to CAS failure", ctx.Value(utils.MsgIdKey), key, startTs, primary)
+			return readWithLock(kv, ctx, key, startTs, primary)
 		}
 	}
 
 	return data, nil
 }
 
-func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
+func read(kv *maelstrom.KV, ctx context.Context, key int, startTs int) (*int, error) {
 	keyStr := strconv.Itoa(key)
 	cells, err := utils.ReadOrElse(kv, keyStr, []cell{})
 	if err != nil {
@@ -250,7 +239,7 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 	for i := len(cells) - 1; i >= 0; i-- {
 		c := cells[i]
 		if c.Lock != nil && c.Ts < startTs {
-			log.Printf("[key=%d, startTs=%d] awaiting transaction at %d", key, startTs, c.Ts)
+			log.Printf("[msgId=%s, key=%d, startTs=%d] awaiting transaction at %d", ctx.Value(utils.MsgIdKey), key, startTs, c.Ts)
 			earlierTxn = true
 			break
 		}
@@ -267,7 +256,7 @@ func read(kv *maelstrom.KV, key int, startTs int) (*int, error) {
 				break
 			}
 			if i == 0 {
-				log.Printf("[key=%d, startTs=%d] proceeding with read", key, startTs)
+				log.Printf("[msgId=%s, key=%d, startTs=%d] proceeding with read", ctx.Value(utils.MsgIdKey), key, startTs)
 				earlierTxn = false
 			}
 		}
@@ -312,7 +301,7 @@ func getLastWrite(cells []cell, startTs int) *int {
 	return data
 }
 
-func preWrite(kv *maelstrom.KV, key int, startTs int, data int, primary int) error {
+func preWrite(kv *maelstrom.KV, ctx context.Context, key int, startTs int, data int, primary int) error {
 	keyStr := strconv.Itoa(key)
 	cells, err := utils.ReadOrElse(kv, keyStr, []cell{})
 	if err != nil {
@@ -325,14 +314,14 @@ func preWrite(kv *maelstrom.KV, key int, startTs int, data int, primary int) err
 
 	locked, err := checkLock(cells, startTs, primary)
 	if err != nil {
-		log.Printf("[key=%d, startTs=%d, primary=%d] write rejection due to %s", key, startTs, primary, err.Error())
+		log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] write rejection due to %s", ctx.Value(utils.MsgIdKey), key, startTs, primary, err)
 		return err
 	}
 
 	if locked {
 		updateData(cells, startTs, data, primary)
 	} else {
-		log.Printf("[key=%d, startTs=%d, data=%d, primary=%d] adding write lock", key, startTs, data, primary)
+		log.Printf("[msgId=%s, key=%d, startTs=%d, data=%d, primary=%d] adding write lock", ctx.Value(utils.MsgIdKey), key, startTs, data, primary)
 		cells = append(cells, cell{
 			Ts:   startTs,
 			Data: &data,
@@ -342,8 +331,8 @@ func preWrite(kv *maelstrom.KV, key int, startTs int, data int, primary int) err
 
 	err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
 	if err != nil {
-		log.Printf("[key=%d, startTs=%d, data=%d, primary=%d] retrying prepare due to CAS failure", key, startTs, data, primary)
-		return preWrite(kv, key, startTs, data, primary)
+		log.Printf("[msgId=%s, key=%d, startTs=%d, data=%d, primary=%d] retrying prepare due to CAS failure", ctx.Value(utils.MsgIdKey), key, startTs, data, primary)
+		return preWrite(kv, ctx, key, startTs, data, primary)
 	}
 	return nil
 }
@@ -370,20 +359,19 @@ func checkLock(cells []cell, startTs int, primary int) (bool, error) {
 }
 
 func updateData(cells []cell, startTs int, data int, primary int) {
-	for i := len(cells) - 1; i >= 0; i-- {
-		c := &cells[i]
-		if c.Lock != nil && c.Ts == startTs {
-			if *c.Lock != primary {
-				panic("primary mismatch")
-			}
-			c.Data = &data // override previous write in same transaction
-			return
+	c := &cells[len(cells)-1]
+	if c.Lock != nil && c.Ts == startTs {
+		if *c.Lock != primary {
+			panic("primary mismatch")
 		}
+		c.Data = &data // override previous write in same transaction
+		return
+	} else {
+		panic("lock not found")
 	}
-	panic("lock not found")
 }
 
-func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int, kind writeKind) error {
+func commit(kv *maelstrom.KV, ctx context.Context, key int, startTs int, commitTs int, primary int, kind writeKind) error {
 	keyStr := strconv.Itoa(key)
 	cells, err := utils.ReadOrElse(kv, keyStr, []cell{})
 	if err != nil {
@@ -394,12 +382,8 @@ func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int, k
 		return err
 	}
 
-	log.Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] removing lock", key, startTs, commitTs, primary, kind)
+	log.Printf("[msgId=%s, key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] removing lock", ctx.Value(utils.MsgIdKey), key, startTs, commitTs, primary, kind)
 	removeLock(cells, startTs, primary)
-
-	if kind == writeRollback {
-		log.Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] rolling back", key, startTs, commitTs, primary, kind)
-	}
 
 	cells = append(cells, cell{ // mark write
 		Ts: commitTs,
@@ -409,16 +393,27 @@ func commit(kv *maelstrom.KV, key int, startTs int, commitTs int, primary int, k
 		},
 	})
 
+	switch kind {
+	case writeCommit:
+		keepCells := keepVersions * 2
+		if len(cells) > keepCells {
+			cells = cells[len(cells)-keepCells:] // truncate history
+		}
+	case writeRollback:
+		log.Printf("[msgId=%s, key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] rolling back", ctx.Value(utils.MsgIdKey), key, startTs, commitTs, primary, kind)
+		cells = cells[:len(cells)-2]
+	}
+
 	err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
 	if err != nil {
-		log.Printf("[key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] retrying commit due to CAS failure", key, startTs, commitTs, primary, kind)
-		return commit(kv, key, startTs, commitTs, primary, kind)
+		log.Printf("[msgId=%s, key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] retrying commit due to CAS failure", ctx.Value(utils.MsgIdKey), key, startTs, commitTs, primary, kind)
+		return commit(kv, ctx, key, startTs, commitTs, primary, kind)
 	}
 
 	return nil
 }
 
-func removeReadLock(kv *maelstrom.KV, key int, startTs int, primary int) error {
+func removeReadOnlyLock(kv *maelstrom.KV, ctx context.Context, key int, startTs int, primary int) error {
 	keyStr := strconv.Itoa(key)
 	cells, err := utils.ReadOrElse(kv, keyStr, []cell{})
 	if err != nil {
@@ -429,28 +424,29 @@ func removeReadLock(kv *maelstrom.KV, key int, startTs int, primary int) error {
 		return err
 	}
 
-	log.Printf("[key=%d, startTs=%d, primary=%d] removing read lock", key, startTs, primary)
+	log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] removing read-only lock", ctx.Value(utils.MsgIdKey), key, startTs, primary)
 	removeLock(cells, startTs, primary)
+
+	cells = cells[:len(cells)-1] // dropping redundant cell
 
 	err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
 	if err != nil {
-		log.Printf("[key=%d, startTs=%d, primary=%d] retrying read lock removal due to CAS failure", key, startTs, primary)
-		return removeReadLock(kv, key, startTs, primary)
+		log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] retrying read-only lock removal due to CAS failure", ctx.Value(utils.MsgIdKey), key, startTs, primary)
+		return removeReadOnlyLock(kv, ctx, key, startTs, primary)
 	}
 
 	return nil
 }
 
 func removeLock(cells []cell, startTs int, primary int) {
-	for i := len(cells) - 1; i >= 0; i-- {
-		c := &cells[i]
-		if c.Ts == startTs && c.Lock != nil {
-			if *c.Lock != primary {
-				panic("primary mismatch")
-			}
-			c.Lock = nil // remove lock
-			return
+	c := &cells[len(cells)-1]
+	if c.Ts == startTs && c.Lock != nil {
+		if *c.Lock != primary {
+			panic("primary mismatch")
 		}
+		c.Lock = nil // remove lock
+		return
+	} else {
+		panic("lock not found")
 	}
-	panic("lock not found")
 }

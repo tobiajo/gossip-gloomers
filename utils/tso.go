@@ -8,6 +8,7 @@ type TSO struct {
 	node *maelstrom.Node
 }
 
+// NewLinTSO returns a client to the linearizable timestamp oracle.
 func NewLinTSO(node *maelstrom.Node) *TSO {
 	return &TSO{
 		node: node,
