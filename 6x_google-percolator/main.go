@@ -78,7 +78,7 @@ func (s *server) txnHandler(ctx context.Context, req Txn) (TxnOk, error) {
 	}
 
 	readLocks := getReadLocks(req.Txn, lockSingleRead)
-	locks := mapset.NewSet[int]()
+	placedLocks := mapset.NewSet[int]()
 
 	result := transaction{}
 	var primary *int
@@ -100,7 +100,7 @@ func (s *server) txnHandler(ctx context.Context, req Txn) (TxnOk, error) {
 					}
 					return *new(TxnOk), err
 				}
-				locks.Add(op.Key)
+				placedLocks.Add(op.Key)
 			} else {
 				value, err = read(s.kv, ctx, op.Key, startTs)
 				if err != nil {
@@ -120,7 +120,7 @@ func (s *server) txnHandler(ctx context.Context, req Txn) (TxnOk, error) {
 				}
 				return *new(TxnOk), err
 			}
-			locks.Add(op.Key)
+			placedLocks.Add(op.Key)
 			result = append(result, NewTxnOp(op.Op, op.Key, op.Value))
 		}
 	}
@@ -141,17 +141,17 @@ func (s *server) txnHandler(ctx context.Context, req Txn) (TxnOk, error) {
 
 	commited := mapset.NewSet[int]()
 	for _, op := range req.Txn {
-		if op.Op == "w" && locks.Contains(op.Key) && !commited.Contains(op.Key) {
+		if op.Op == "w" && placedLocks.Contains(op.Key) && !commited.Contains(op.Key) {
 			if err := commit(s.kv, ctx, op.Key, startTs, commitTs, *primary, kind); err != nil {
 				return *new(TxnOk), err
 			}
-			locks.Remove(op.Key)
+			placedLocks.Remove(op.Key)
 			commited.Add(op.Key)
 		}
 	}
 
-	for key := range locks.Iter() {
-		if err := removeReadOnlyLock(s.kv, ctx, key, startTs, *primary); err != nil { // if no commits
+	for key := range placedLocks.Iter() {
+		if err := releaseReadOnlyLock(s.kv, ctx, key, startTs, *primary); err != nil { // if no commits
 			return *new(TxnOk), err
 		}
 	}
@@ -211,7 +211,7 @@ func readWithLock(kv *maelstrom.KV, ctx context.Context, key int, startTs int, p
 		if err != nil {
 			return new(int), err
 		}
-		log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] adding read lock", ctx.Value(utils.MsgIdKey), key, startTs, primary)
+		log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] placing read lock", ctx.Value(utils.MsgIdKey), key, startTs, primary)
 		cells = append(cells, cell{
 			Ts:   startTs,
 			Data: data, // write existing value
@@ -321,7 +321,7 @@ func preWrite(kv *maelstrom.KV, ctx context.Context, key int, startTs int, data 
 	if locked {
 		updateData(cells, startTs, data, primary)
 	} else {
-		log.Printf("[msgId=%s, key=%d, startTs=%d, data=%d, primary=%d] adding write lock", ctx.Value(utils.MsgIdKey), key, startTs, data, primary)
+		log.Printf("[msgId=%s, key=%d, startTs=%d, data=%d, primary=%d] placing write lock", ctx.Value(utils.MsgIdKey), key, startTs, data, primary)
 		cells = append(cells, cell{
 			Ts:   startTs,
 			Data: &data,
@@ -382,8 +382,8 @@ func commit(kv *maelstrom.KV, ctx context.Context, key int, startTs int, commitT
 		return err
 	}
 
-	log.Printf("[msgId=%s, key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] removing lock", ctx.Value(utils.MsgIdKey), key, startTs, commitTs, primary, kind)
-	removeLock(cells, startTs, primary)
+	log.Printf("[msgId=%s, key=%d, startTs=%d, commitTs=%d, primary=%d, kind=%s] releasing lock", ctx.Value(utils.MsgIdKey), key, startTs, commitTs, primary, kind)
+	releaseLock(cells, startTs, primary)
 
 	cells = append(cells, cell{ // mark write
 		Ts: commitTs,
@@ -413,7 +413,7 @@ func commit(kv *maelstrom.KV, ctx context.Context, key int, startTs int, commitT
 	return nil
 }
 
-func removeReadOnlyLock(kv *maelstrom.KV, ctx context.Context, key int, startTs int, primary int) error {
+func releaseReadOnlyLock(kv *maelstrom.KV, ctx context.Context, key int, startTs int, primary int) error {
 	keyStr := strconv.Itoa(key)
 	cells, err := utils.ReadOrElse(kv, keyStr, []cell{})
 	if err != nil {
@@ -424,27 +424,27 @@ func removeReadOnlyLock(kv *maelstrom.KV, ctx context.Context, key int, startTs 
 		return err
 	}
 
-	log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] removing read-only lock", ctx.Value(utils.MsgIdKey), key, startTs, primary)
-	removeLock(cells, startTs, primary)
+	log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] releasing read-only lock", ctx.Value(utils.MsgIdKey), key, startTs, primary)
+	releaseLock(cells, startTs, primary)
 
 	cells = cells[:len(cells)-1] // dropping redundant cell
 
 	err = kv.CompareAndSwap(context.Background(), keyStr, unmodified, cells, true)
 	if err != nil {
-		log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] retrying read-only lock removal due to CAS failure", ctx.Value(utils.MsgIdKey), key, startTs, primary)
-		return removeReadOnlyLock(kv, ctx, key, startTs, primary)
+		log.Printf("[msgId=%s, key=%d, startTs=%d, primary=%d] retrying read-only lock release due to CAS failure", ctx.Value(utils.MsgIdKey), key, startTs, primary)
+		return releaseReadOnlyLock(kv, ctx, key, startTs, primary)
 	}
 
 	return nil
 }
 
-func removeLock(cells []cell, startTs int, primary int) {
+func releaseLock(cells []cell, startTs int, primary int) {
 	c := &cells[len(cells)-1]
 	if c.Ts == startTs && c.Lock != nil {
 		if *c.Lock != primary {
 			panic("primary mismatch")
 		}
-		c.Lock = nil // remove lock
+		c.Lock = nil // release lock
 		return
 	} else {
 		panic("lock not found")
