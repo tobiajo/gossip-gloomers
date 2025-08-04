@@ -31,8 +31,8 @@ func main() {
 
 func (s *server) txnHandler(req Txn) (TxnOk, error) {
 	txn, err := transact(s.kv, req.Txn)
-	for err != nil {
-		txn, err = transact(s.kv, req.Txn)
+	if err != nil {
+		return *new(TxnOk), err
 	}
 
 	res := TxnOk{
@@ -70,7 +70,7 @@ func transact(kv *maelstrom.KV, txn []TxnOp) ([]TxnOp, error) {
 	}
 	err = kv.CompareAndSwap(context.Background(), "STATE_REF", stateRef, updatedStateRef, true)
 	if err != nil {
-		return nil, err
+		return transact(kv, txn) // retry on CAS failure
 	}
 
 	return result, nil

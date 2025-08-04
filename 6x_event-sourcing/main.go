@@ -33,8 +33,8 @@ func main() {
 
 func (s *server) txnHandler(req Txn) (TxnOk, error) {
 	txnLog, err := appendTxnLog(s.kv, req.Txn)
-	for err != nil {
-		txnLog, err = appendTxnLog(s.kv, req.Txn) // retry once
+	if err != nil {
+		return *new(TxnOk), err
 	}
 	state := recoverState(txnLog)
 
@@ -74,7 +74,7 @@ func appendTxnLog(kv *maelstrom.KV, txn transaction) ([]transaction, error) {
 	}
 	err = kv.CompareAndSwap(context.Background(), "TXN_LOG_REF", txnLogRef, updatedTxnLogRef, true)
 	if err != nil {
-		return *new([]transaction), err
+		return appendTxnLog(kv, txn) // retry on CAS failure
 	}
 
 	return txnLog, nil
