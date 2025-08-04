@@ -133,23 +133,20 @@ func (s *server) txnHandler(ctx context.Context, req Txn) (TxnOk, error) {
 	}
 
 	var kind writeKind
-	if conflict != nil {
-		kind = writeRollback
-	} else {
+	if conflict == nil {
 		kind = writeCommit
+	} else {
+		kind = writeRollback
 	}
 
-	commited := mapset.NewSet[int]()
 	for _, op := range req.Txn {
-		if op.Op == "w" && placedLocks.Contains(op.Key) && !commited.Contains(op.Key) {
+		if op.Op == "w" && placedLocks.Contains(op.Key) {
 			if err := commit(s.kv, ctx, op.Key, startTs, commitTs, *primary, kind); err != nil {
 				return *new(TxnOk), err
 			}
 			placedLocks.Remove(op.Key)
-			commited.Add(op.Key)
 		}
 	}
-
 	for key := range placedLocks.Iter() {
 		if err := releaseReadOnlyLock(s.kv, ctx, key, startTs, *primary); err != nil { // if no commits
 			return *new(TxnOk), err
