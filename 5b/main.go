@@ -14,11 +14,11 @@ type server struct {
 }
 
 func messageLogKey(key string) string {
-	return "messageLog," + key
+	return "messageLog:" + key
 }
 
 func committedOffsetKey(key string) string {
-	return "committedOffset," + key
+	return "committedOffset:" + key
 }
 
 // Challenge #5b: Multi-Node Kafka-Style Log

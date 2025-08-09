@@ -39,7 +39,7 @@ func main() {
 	go func() {
 		for range time.Tick(time.Second) {
 			for _, delivery := range s.unconfirmedDelivery.ToSlice() {
-				s.pendingDelivery.Add(delivery)
+				s.pendingDelivery.Add(delivery) // batches delivery
 			}
 		}
 	}()
@@ -57,7 +57,7 @@ func main() {
 			for dest, messages := range messages {
 				err := utils.SendAsync(n, "deliver", dest, Deliver{messages})
 				if err != nil {
-					return
+					log.Printf("error async deliver to %s: %v", dest, err)
 				}
 			}
 		}

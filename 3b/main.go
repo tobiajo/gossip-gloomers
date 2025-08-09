@@ -38,12 +38,12 @@ func main() {
 	}
 }
 
-func (s *server) broadcastHandler(req Broadcast) (*BroadcastOk, error) {
-	deliverReq := Deliver{req.Message}
+func (s *server) broadcastHandler(req Broadcast) (BroadcastOk, error) {
+	deliverReq := req.ToDeliver()
 	for _, dest := range s.n.NodeIDs() {
 		err := utils.SendAsync(s.n, "deliver", dest, deliverReq)
 		if err != nil {
-			return nil, err
+			return *new(BroadcastOk), err
 		}
 	}
 
@@ -52,19 +52,19 @@ func (s *server) broadcastHandler(req Broadcast) (*BroadcastOk, error) {
 	s.mu.Unlock()
 
 	res := BroadcastOk{}
-	return &res, nil
+	return res, nil
 }
 
-func (s *server) readHandler(req Read) (*ReadOk, error) {
+func (s *server) readHandler(req Read) (ReadOk, error) {
 	res := ReadOk{
 		Messages: s.deliveredSelf,
 	}
-	return &res, nil
+	return res, nil
 }
 
-func (s *server) topologyHandler(req Topology) (*TopologyOk, error) {
+func (s *server) topologyHandler(req Topology) (TopologyOk, error) {
 	res := TopologyOk{}
-	return &res, nil
+	return res, nil
 }
 
 func (s *server) deliverHandler(req Deliver) error {

@@ -84,6 +84,7 @@ func RegisterAsyncHandler[Req any](n *maelstrom.Node, typ string, handler func(R
 	})
 }
 
+// Stubborn send, retries until success.
 func Send[Req any, Res any](n *maelstrom.Node, typ string, dest string, req Req) (Res, error) {
 	reqJson, err := asJson(req)
 	if err != nil {
@@ -94,7 +95,7 @@ func Send[Req any, Res any](n *maelstrom.Node, typ string, dest string, req Req)
 	msg, err := n.SyncRPC(context.Background(), dest, reqJson)
 	for err != nil {
 		time.Sleep(time.Second)
-		log.Println("retrying send")
+		log.Printf("[typ=%s, dest=%s, req=%v] retrying send: %v", typ, dest, req, err)
 		msg, err = n.SyncRPC(context.Background(), dest, req)
 	}
 

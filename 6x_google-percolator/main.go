@@ -53,7 +53,7 @@ const (
 )
 
 // https://tikv.org/deep-dive/distributed-transaction/percolator/
-// TODO clean up danglig lock after crashes
+// TODO clean up dangling locks after crashes
 func main() {
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
@@ -126,7 +126,7 @@ func (s *server) txnHandler(ctx context.Context, req Txn) (TxnOk, error) {
 	}
 
 	// Commit phase
-	// TODO https://tikv.org/deep-dive/distributed-transaction/optimized-percolator/#calculated-commit-timestamp w/o read lock
+	// TODO https://tikv.org/deep-dive/distributed-transaction/optimized-percolator/#calculated-commit-timestamp without read lock
 	commitTs, err := s.tso.Get()
 	if err != nil {
 		return *new(TxnOk), err

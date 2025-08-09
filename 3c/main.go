@@ -39,7 +39,7 @@ func main() {
 			for _, delivery := range s.unconfirmedDelivery.ToSlice() {
 				err := utils.SendAsync(s.n, "deliver", delivery.dest, Deliver{delivery.message})
 				if err != nil {
-					return
+					log.Printf("error async deliver to %s: %v", delivery.dest, err)
 				}
 			}
 		}

@@ -4,6 +4,12 @@ type Broadcast struct {
 	Message int `json:"message"`
 }
 
+func (b *Broadcast) ToDeliver() Deliver {
+	return Deliver{
+		Message: b.Message,
+	}
+}
+
 type BroadcastOk struct{}
 
 type Read struct{}

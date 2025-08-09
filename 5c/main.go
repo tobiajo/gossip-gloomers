@@ -19,20 +19,18 @@ type server struct {
 	mus cmap.ConcurrentMap[string, *sync.Mutex]
 }
 
-type nodeID = string
-
 func messageLogKey(key string) string {
-	return "messageLog," + key
+	return "messageLog:" + key
 }
 
 func committedOffsetKey(key string) string {
-	return "committedOffset," + key
+	return "committedOffset:" + key
 }
 
 func keyToNodeID(key string, nodes int) string {
 	hash := fnv.New32()
 	hash.Write([]byte(key))
-	return "n" + strconv.Itoa(int(hash.Sum32()%uint32(nodes-1))) // TODO: consistent hashing
+	return "n" + strconv.Itoa(int(hash.Sum32()%uint32(nodes))) // TODO: consistent hashing
 }
 
 // Challenge #5c: Efficient Kafka-Style Log
@@ -41,7 +39,7 @@ func main() {
 	n := maelstrom.NewNode()
 	s := server{
 		n:   n,
-		kv:  maelstrom.NewSeqKV(n), // TODO: `SeqKV` safe with single writer? assuming eventual consistency reads on non-writer nodes
+		kv:  maelstrom.NewSeqKV(n), // safe with single writer for a key, assuming OK to have eventual consistent reads on non-writer nodes
 		mus: cmap.New[*sync.Mutex](),
 	}
 
